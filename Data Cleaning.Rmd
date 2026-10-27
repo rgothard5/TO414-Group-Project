@@ -1,0 +1,63 @@
+---
+title: "Data Cleaning"
+author: "Raegan Gothard"
+date: "2026-10-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data Cleaning
+
+```{r}
+# Remove unique identifier columns and the empty unnamed column
+patient$encounter_id <- NULL
+patient$patient_id <- NULL
+patient$hospital_id <- NULL
+patient$icu_id <- NULL
+patient$X <- NULL
+
+# The APACHE IV death probabilities are already a prediction of our response variable
+patient$apache_4a_hospital_death_prob <- NULL
+patient$apache_4a_icu_death_prob <- NULL
+
+# The APACHE diagnosis codes are IDs, not real numbers, and apache_2_bodysystem repeats apache_3j_bodysystem
+patient$apache_2_diagnosis <- NULL
+patient$apache_3j_diagnosis <- NULL
+patient$apache_2_bodysystem <- NULL
+
+# Blank categorical values become their own "Unknown" level, then convert to factors
+cat_cols <- names(patient)[sapply(patient, is.character)]
+for (v in cat_cols) {
+  patient[[v]][patient[[v]] == ""] <- "Unknown"
+  patient[[v]] <- as.factor(patient[[v]])
+}
+
+# Fill missing numeric values with the column median
+colSums(is.na(patient))
+num_cols <- setdiff(names(patient)[sapply(patient, is.numeric)], "hospital_death")
+for (v in num_cols) {
+  patient[[v]][is.na(patient[[v]])] <- median(patient[[v]], na.rm = TRUE)
+}
+sum(is.na(patient))
+
+# Create dummy variables for categorical data (drop the intercept column so each factor has a reference level)
+patient_d <- as.data.frame(model.matrix(~ ., data = patient)[, -1])
+
+str(patient_d)
+
+# Save object into RSD
+saveRDS(patient_d, file = "cleaned_dataset.rds")
+
+```
+
+Cleaning choices:
+
+- We removed the ID columns (`encounter_id`, `patient_id`, `hospital_id`, `icu_id`) and the empty column `X`, since they say nothing about whether a patient survives.
+- We removed the two APACHE IV death probabilities. They are already a prediction of death, so including them would leak the answer into the model.
+- We removed the APACHE diagnosis codes because they are ID numbers for hundreds of diagnoses, not real quantities, and kept the body system grouping instead. `apache_2_bodysystem` repeats `apache_3j_bodysystem`, so we dropped it too.
+- Blank values in the categorical columns became an "Unknown" level, and those columns were converted to factors.
+- Every patient is missing at least one lab or vital sign, and `glm` drops any row with a missing value, which would have thrown out about 31% of patients. We filled missing numeric values with the column median instead.
+- We created dummy variables for the factors so the data is ready for the train/test split.
