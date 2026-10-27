@@ -12,6 +12,9 @@ knitr::opts_chunk$set(echo = TRUE)
 ## Data Cleaning
 
 ```{r}
+
+patient <- read.csv("patient.csv")
+
 # Remove unique identifier columns and the empty unnamed column
 patient$encounter_id <- NULL
 patient$patient_id <- NULL
