@@ -1,0 +1,130 @@
+---
+title: "K-Means Clustering"
+author: "Raegan Gothard"
+date: "2026-11-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## K-Means Clustering
+
+K-means is unsupervised, so it does not use `hospital_death` to form groups. Instead, it groups ICU patients by how similar their vital signs and lab results are in their first 24 hours. Then we check whether the groups differ on things the algorithm never saw, like death rate and age.
+
+## Exploring the Data
+
+```{r}
+
+patient <- readRDS("cleaned_dataset.rds")
+
+str(patient[, 1:10])
+sum(is.na(patient))
+
+# Cluster only on vital signs and lab results
+# Demographics, chronic conditions, admission details, and hospital_death are saved for profiling the clusters afterwards
+apache_vitals <- c("arf_apache", "gcs_eyes_apache", "gcs_motor_apache", "gcs_unable_apache",
+                   "gcs_verbal_apache", "heart_rate_apache", "intubated_apache", "map_apache",
+                   "resprate_apache", "temp_apache", "ventilated_apache")
+vitals_cols <- names(patient)[grepl("^(d1_|h1_)", names(patient)) | names(patient) %in% apache_vitals]
+
+# The noninvasive blood pressure columns are almost exact copies of the regular ones,
+# so only keep one to avoid counting blood pressure twice
+cor(patient$d1_sysbp_max, patient$d1_sysbp_noninvasive_max)
+vitals_cols <- vitals_cols[!grepl("noninvasive", vitals_cols)]
+
+vitals <- patient[, vitals_cols]
+ncol(vitals)
+
+# Normalize so columns with large values (like glucose) don't dominate the distance
+vitals_z <- as.data.frame(lapply(vitals, scale))
+
+summary(vitals_z[, 1:4])
+
+```
+
+## Choosing the Number of Clusters
+
+The rule of thumb from class, the square root of n / 2, gives about 214 clusters, which is too many to be useful. So we use the elbow method instead. K-means starts from random points, so `nstart = 10` runs it 10 times and keeps the best result.
+
+```{r, warning=FALSE}
+
+sqrt(nrow(vitals_z) / 2)
+
+k_values <- 2:8
+within_ss <- c()
+for (k in k_values) {
+  set.seed(12345)
+  within_ss <- c(within_ss, kmeans(vitals_z, k, nstart = 10, iter.max = 50)$tot.withinss)
+}
+
+plot(k_values, within_ss, type = "b", xlab = "Number of Clusters (k)",
+     ylab = "Total Within-Cluster Sum of Squares", main = "Elbow Method")
+
+```
+
+The curve bends gradually, with no distinct sharp elbow. We chose k = 5, because it splits patients into groups that are all a usable size, and it is small enough for a care team to act on.
+
+## Training the Model
+
+```{r, warning=FALSE}
+
+set.seed(12345)
+patient_clusters <- kmeans(vitals_z, 5, nstart = 10, iter.max = 50)
+
+```
+
+## Evaluating the Clusters
+
+```{r}
+
+patient_clusters$size
+
+# Share of all patients in each cluster
+round(patient_clusters$size / nrow(patient), 3)
+
+# Cluster centers are z-scores: positive is above the average patient, negative is below
+round(t(patient_clusters$centers), 2)
+
+```
+
+No cluster is too small or too large to be useful, with each accounting for 13% to 27% of patients. Reading the centers, each cluster has a clear clinical pattern:
+
+| Cluster | Patients | What stands out | Label |
+|---|---|---|---|
+| 1 | 14,735 | Blood pressure well above average | High Blood Pressure |
+| 2 | 11,947 | Very low GCS scores (eyes, motor, verbal), most likely to be ventilated and intubated | Unresponsive and Ventilated |
+| 3 | 18,509 | Fast heart rate, faster breathing, higher temperature, slightly low blood pressure | Fast Heart Rate |
+| 4 | 24,931 | Slower heart rate, good GCS scores, least likely to be ventilated | Stable |
+| 5 | 21,591 | Blood pressure well below average, but GCS scores are good | Low Blood Pressure |
+
+## Applying the Clusters Back to the Data
+
+```{r}
+
+patient$cluster <- patient_clusters$cluster
+
+patient[1:5, c("cluster", "age", "genderM", "hospital_death")]
+
+# None of these columns were used to create the clusters
+mean(patient$hospital_death)
+aggregate(data = patient, hospital_death ~ cluster, mean)
+aggregate(data = patient, age ~ cluster, mean)
+aggregate(data = patient, genderM ~ cluster, mean)
+aggregate(data = patient, apache_post_operative ~ cluster, mean)
+aggregate(data = patient, apache_3j_bodysystemSepsis ~ cluster, mean)
+
+```
+
+## Findings
+
+The clusters are strong evidence that first-day vital signs separate patients by risk, even though the algorithm never saw who died. The overall death rate is 8.6%, but it ranges from 2.1% to 25.3% across clusters:
+
+- **Unresponsive and Ventilated (Cluster 2)** has the highest death rate at 25.3%, about three times the overall rate, even though it is only 13% of patients.
+- **Fast Heart Rate (Cluster 3)** has the second highest death rate at 11.6%. About 26% of these patients were admitted for sepsis, the highest share of any cluster.
+- **Low Blood Pressure (Cluster 5)** is close to the overall rate at 7.1%. These patients are the oldest on average (64.8) and the most likely to be coming from surgery (28%).
+- **High Blood Pressure (Cluster 1)** is below the overall rate at 4.7%.
+- **Stable (Cluster 4)** is the largest group and has the lowest death rate at 2.1%.
+
+Average age only ranges from about 60 to 65 across clusters, so the difference in death rates is not simply explained by age. Hospitals could use these groups to direct extra monitoring and staff toward the patients who look most like Clusters 2 and 3. These are patterns rather than causes, and the labels are simplifications, so patients within a cluster can still differ from one another.
