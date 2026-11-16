@@ -1,0 +1,172 @@
+---
+title: "Group Project 2 - Logistic Regression Models"
+author: "Ethan Peterson, Jose Soria Miquel, Raegan Gothard, Tarini Bengani, and Yashwant Dubbaka"
+date: "2026-11-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Logistic Regression
+
+Logistic regression is used when the outcome is binary, like died or survived. Instead of predicting a number directly, it estimates the probability that each patient dies, using a curve that always stays between 0 and 1. We build two versions: **Model 1** adds a few nonlinear effects (curves) to the predictors, and **Model 2** keeps everything in Model 1 and adds interaction effects suggested by our data visualizations. Both are built on the training patients. We pick the better one using AIC, and then judge only that model on the test patients.
+
+### Loading the Cleaned Data and Splitting It
+
+We load the cleaned, dummy-coded dataset saved by the Data Cleaning file. We then add the new columns that the nonlinear and interaction effects need (a squared column lets an effect bend into a curve, and two columns multiplied together let one variable's effect depend on another). Finally, we split the data into a 70% training set (to build the models) and a 30% test set (to judge a model on patients it has never seen). We set the random seed to `12345` so the split is the same every time.
+
+```{r split}
+library(caret)   # used later for confusion matrices
+
+# Load the cleaned dataset saved by the Data Cleaning file
+patient_d <- readRDS("cleaned_dataset.rds")
+
+# Nonlinear effects (squared columns): these let an effect bend instead of being a straight line
+patient_d$age_sq <- patient_d$age^2
+patient_d$bmi_sq <- patient_d$bmi^2
+
+# Interaction effects (two columns multiplied together): these let one variable's effect depend on another
+patient_d$vent_gcs   <- patient_d$ventilated_apache * patient_d$gcs_motor_apache        # ventilated x GCS motor score
+patient_d$vent_floor <- patient_d$ventilated_apache * patient_d$icu_admit_sourceFloor   # ventilated x admitted from a floor
+
+# Keep track of which columns are which
+nonlinear_cols   <- c("age_sq", "bmi_sq")
+interaction_cols <- c("vent_gcs", "vent_floor")
+base_cols        <- setdiff(names(patient_d), c(nonlinear_cols, interaction_cols))   # every original column
+
+ratio <- 0.7
+
+# Set seed so the same random split is produced every time
+set.seed(12345)
+
+# Randomly pick 70% of the rows for training
+train_rows <- sample(1:nrow(patient_d), ratio * nrow(patient_d))
+
+# Training set = the chosen rows, test set = all the other rows
+patient_train <- patient_d[train_rows, ]
+patient_test  <- patient_d[-train_rows, ]
+
+# The death rate should be similar in both sets if the split is fair
+mean(patient_train$hospital_death); mean(patient_test$hospital_death)
+```
+
+The death rate is about `r round(100 * mean(patient_train$hospital_death), 1)`% in the training set and `r round(100 * mean(patient_test$hospital_death), 1)`% in the test set, so the split is representative.
+
+### Model 1: Nonlinear Effects
+
+#### Building the Model
+
+Model 1 starts with every predictor in the cleaned data and adds two nonlinear effects. I changed only these things so that any difference from Model 2 can be credited to the interaction effects added there.
+
+- **Age curve (Figure 1).** The death rate in Figure 1 rises a little faster at older ages. *Our hypothesis:* the effect of age is not a straight line, so we add `age_sq` (age squared) to let it bend.
+- **BMI curve (not in a figure, but BMI is one of the key patient measures in the summary statistics).** *Our hypothesis:* body weight affects risk in a curved way rather than a straight line. Very thin patients are often frail and at higher risk, while the protection from a higher BMI may fade at the heavy end. We add `bmi_sq` (BMI squared) to test this.
+
+```{r model1-all}
+# Logistic regression using all original predictors plus the two nonlinear effects
+# (family = "binomial" is what makes glm() a logistic regression)
+model_1_all <- glm(hospital_death ~ ., data = patient_train[, c(base_cols, nonlinear_cols)], family = "binomial")
+AIC(model_1_all)
+```
+
+Many predictors in this model do not help. To remove the insignificant ones, we look at the p-value of each predictor (a high p-value means there is little evidence it matters) and keep only those below 0.2. We use this lenient cutoff instead of the usual 0.05 because the dummy columns for a category (such as the levels of ethnicity or ICU type) can matter as a group even when each one alone looks weak, and a stricter cutoff made the model fit worse. We always keep age and BMI, since a squared term should not be used without the original variable.
+
+```{r model1-reduce}
+# p-value of every predictor in the model above (row 1 is the intercept, so we skip it)
+p_values <- summary(model_1_all)$coefficients[-1, 4]
+
+# Keep the predictors with a p-value below 0.2, plus age and BMI (needed alongside age_sq and bmi_sq)
+keep_cols <- gsub("`", "", names(p_values)[p_values < 0.2])
+keep_cols <- union(keep_cols, c("age", "bmi", nonlinear_cols))
+
+# Model 1: logistic regression on the kept predictors only
+model_1 <- glm(hospital_death ~ ., data = patient_train[, c("hospital_death", keep_cols)], family = "binomial")
+
+summary(model_1)
+```
+
+The model started with `r length(p_values)` predictors, and `r length(keep_cols)` were kept. The AIC went from `r sprintf("%.1f", AIC(model_1_all))` to `r sprintf("%.1f", AIC(model_1))`, so removing the insignificant predictors made the model slightly better, not worse.
+
+```{r or-name, include=FALSE}
+# Name of the "admitted from the operating room" coefficient (used in the text below)
+or_name <- names(coef(model_1))[grepl("Operating Room", names(coef(model_1)))]
+```
+
+#### What Model 1 Tells Us
+
+A positive coefficient means a variable raises the chance of dying, and a negative one lowers it, holding the other variables constant. The strongest findings:
+
+- **Ventilated patients are at much higher risk.** Being ventilated raises the odds of dying about `r round(exp(coef(model_1)["ventilated_apache"]), 1)` times.
+- **Older age raises risk, but the curve levels off.** The `age_sq` coefficient is negative, so once the other measures of how sick a patient is are accounted for, the effect of age levels off at older ages instead of speeding up. The raw rise in Figure 1 partly reflects that older patients are also sicker in other ways that the model already includes.
+- **BMI has a curved effect.** The `bmi_sq` coefficient is positive and significant, so the relationship between BMI and risk is curved: the lower risk that comes with a higher BMI fades at the heavy end, as hypothesized.
+- **A more responsive patient is safer.** Each one-point increase in the GCS motor score lowers the odds by about `r round(100 * (1 - exp(coef(model_1)["gcs_motor_apache"])))`%, matching Figure 2.
+- **Metastatic cancer is a strong warning sign.** It raises the odds about `r round(exp(coef(model_1)["solid_tumor_with_metastasis"]), 1)` times.
+- **Low oxygen and low body temperature in the first day raise risk.** Each point lower in the minimum oxygen level raises the odds by about `r round(100 * (exp(-coef(model_1)["d1_spo2_min"]) - 1), 1)`%, and each degree lower in minimum body temperature by about `r round(100 * (exp(-coef(model_1)["d1_temp_min"]) - 1))`%.
+- **Elective surgery and admission from the operating room are protective.** Both lower the odds of dying (about `r round(100 * (1 - exp(coef(model_1)["elective_surgery"])))`% and `r round(100 * (1 - exp(coef(model_1)[or_name])))`% lower), which matches Figure 3: these are mostly planned surgeries.
+
+These are associations, not proof of cause, so they should guide where to look rather than be treated as guaranteed fixes.
+
+### Model 2: Nonlinear Plus Interaction Effects
+
+#### Building the Model
+
+Model 2 keeps every predictor from Model 1 (including both nonlinear effects) and adds two interaction effects that our data visualizations suggested. I changed only these things so that any difference from Model 1 can be credited to them.
+
+- **Ventilation and GCS motor score (Figure 2).** The gap between ventilated and non-ventilated patients is not the same at every motor score. *Our hypothesis:* ventilation raises risk by different amounts depending on how responsive the patient already is, since the most unresponsive patients are at high risk with or without a ventilator. We add `vent_gcs` (ventilated times GCS motor score).
+- **Ventilation and admission from a hospital floor (Figure 3).** Patients transferred from a floor already die at a high rate. *Our hypothesis:* being ventilated tells us less about patients who were already getting worse on the floor than about patients who came from other places. We add `vent_floor` (ventilated times admitted from a floor).
+
+```{r model2-build}
+# Model 2: Model 1's predictors + the two interaction effects
+# (the main effects of the interacting variables are included too, so the interactions can be read properly)
+model_2_cols <- union(keep_cols, c(interaction_cols, "ventilated_apache", "gcs_motor_apache", "icu_admit_sourceFloor"))
+
+model_2 <- glm(hospital_death ~ ., data = patient_train[, c("hospital_death", model_2_cols)], family = "binomial")
+
+summary(model_2)
+```
+
+Both interaction effects are statistically significant, and the AIC improved from `r sprintf("%.1f", AIC(model_1))` in Model 1 to `r sprintf("%.1f", AIC(model_2))` in Model 2, so the added effects improve the fit even after the penalty for extra complexity. What they say, in plain terms:
+
+- **Ventilation and motor score:** the positive interaction means ventilation adds more risk for patients who are otherwise responsive than for patients who are already unresponsive, matching what we saw in Figure 2.
+- **Ventilation and floor transfers:** the negative interaction means ventilation adds less extra risk for patients transferred from a floor, who were already high risk, matching our hypothesis.
+
+### Choosing Between the Models
+
+We choose between the two models using the **AIC**, which balances how well a model fits against how complicated it is (lower is better).
+
+```{r choose-model}
+# Compare the AIC of the two models and keep the one with the lower AIC
+AIC(model_1); AIC(model_2)
+
+if (AIC(model_2) < AIC(model_1)) {
+  final_model <- model_2
+  final_name  <- "Model 2"
+} else {
+  final_model <- model_1
+  final_name  <- "Model 1"
+}
+final_name
+```
+
+**Decision:** Model 1 has an AIC of `r sprintf("%.1f", AIC(model_1))` and Model 2 has `r sprintf("%.1f", AIC(model_2))`, so we go ahead with **`r final_name`**.
+
+### Test Data Prediction and Evaluation of `r final_name`
+
+Here I use the trained model to predict on the `r format(nrow(patient_test), big.mark = ",")` patients in the test set, which the model has never seen. `predict(..., type = "response")` returns a probability of dying for each patient. To turn a probability into a yes/no flag I use a threshold of **0.5**: patients with a predicted chance of dying of 50% or more are flagged.
+
+```{r test-final}
+# Predicted probability of dying for each test patient
+test_prob <- predict(final_model, patient_test, type = "response")
+summary(test_prob)
+
+# Flag as "will die" (1) if predicted probability is at least 0.5
+test_flag <- ifelse(test_prob >= 0.5, 1, 0)
+table(test_flag)
+
+# Compare predictions to what actually happened ("1" = died is the positive class)
+cm_final <- confusionMatrix(as.factor(test_flag), as.factor(patient_test$hospital_death), positive = "1")
+cm_final
+```
+
+Accuracy is about `r round(100 * cm_final$overall["Accuracy"])`%, but that is almost the same as the `r round(100 * (1 - mean(patient_test$hospital_death)))`% we would get by predicting that nobody dies, so accuracy alone flatters this model. The more useful numbers are sensitivity (`r round(100 * cm_final$byClass["Sensitivity"])`%) and specificity (`r round(100 * cm_final$byClass["Specificity"])`%). The model catches only `r cm_final$table["1", "1"]` of the `r sum(patient_test$hospital_death)` patients who died and misses `r cm_final$table["0", "1"]` of them (false negatives, patients predicted to survive who died). These are the costly errors because the care team gets no warning. On the other hand, the patients it does flag are usually right: `r round(100 * cm_final$byClass["Pos Pred Value"])`% of flagged patients died, and there were only `r cm_final$table["1", "0"]` false positives (patients flagged who survived).
