@@ -1,0 +1,237 @@
+---
+title: "Group Project 2 - K-Nearest Neighbors (KNN)"
+author: "Jose Soria Miquel"
+date: "2026-11-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## K-Nearest Neighbors (KNN)
+
+KNN predicts whether a patient will die in the hospital by comparing that patient with other patients who have similar characteristics. Unlike logistic regression, KNN does not estimate coefficients. It looks at the *K nearest neighbors* and uses the proportion who died as a predicted risk score.
+
+Our goal is to identify high-risk ICU patients who may need closer monitoring. Because only about 8.6% of patients died, **accuracy alone can be misleading**. We focus on sensitivity (how many actual deaths the model catches), specificity (how many survivors it correctly identifies), balanced accuracy, and Kappa.
+
+### Loading the Cleaned Data and Splitting It
+
+We use the same cleaned dataset, random seed, and 70/30 split as the logistic regression analysis, making it possible to compare the models on the same patients. KNN is sensitive to differences in measurement scales, so we will standardize the predictors using **training data only**.
+
+```{r split}
+library(caret)  # confusion matrices and performance metrics
+library(RANN)   # efficient nearest-neighbor search on a large dataset
+
+# Use the cleaned, dummy-coded dataset created by our teammate
+patient_d <- readRDS("cleaned_dataset.rds")
+
+# Match the split used by the logistic regression file
+ratio <- 0.7
+set.seed(12345)
+train_rows <- sample(1:nrow(patient_d), ratio * nrow(patient_d))
+
+patient_train <- patient_d[train_rows, ]
+patient_test  <- patient_d[-train_rows, ]
+
+# Check sample sizes and outcome balance
+nrow(patient_train)
+nrow(patient_test)
+mean(patient_train$hospital_death)
+mean(patient_test$hospital_death)
+```
+
+### Choosing the Predictors
+
+Distance-based models can become slow and less informative when we include hundreds of columns. For this KNN model, we focus on a manageable set of clinical and admission characteristics that were relevant in our exploratory analysis or logistic regression. We do **not** include `hospital_death` among the predictors.
+
+```{r predictors}
+# Clinically relevant features, selected before evaluating the test set
+candidate_vars <- c(
+  "age", "bmi", "pre_icu_los_days",
+  "gcs_motor_apache", "ventilated_apache", "intubated_apache",
+  "d1_heartrate_max", "d1_resprate_max", "d1_sysbp_min",
+  "d1_spo2_min", "d1_temp_min", "glucose_apache",
+  "creatinine_apache", "solid_tumor_with_metastasis",
+  "elective_surgery", "icu_admit_sourceFloor"
+)
+
+# Keep only names that actually exist in the cleaned dataset
+knn_vars <- intersect(candidate_vars, names(patient_d))
+print(knn_vars)
+
+# Make missing columns visible rather than silently forgetting about them
+setdiff(candidate_vars, knn_vars)
+stopifnot(length(knn_vars) >= 8)
+
+# Function to standardize a new dataset using only the reference training set
+standardize_knn <- function(train_data, new_data, variables) {
+  x_train <- as.matrix(train_data[, variables, drop = FALSE])
+  x_new   <- as.matrix(new_data[, variables, drop = FALSE])
+
+  train_mean <- colMeans(x_train)
+  train_sd   <- apply(x_train, 2, sd)
+  usable     <- is.finite(train_sd) & train_sd > 0
+
+  # Constant predictors cannot be standardized, so remove them
+  x_train <- scale(x_train[, usable, drop = FALSE],
+                   center = train_mean[usable], scale = train_sd[usable])
+  x_new   <- scale(x_new[, usable, drop = FALSE],
+                   center = train_mean[usable], scale = train_sd[usable])
+
+  stopifnot(all(is.finite(x_train)), all(is.finite(x_new)))
+  list(train = x_train, new = x_new)
+}
+```
+
+### Choosing the Best K and Classification Threshold
+
+A small K can be noisy, whereas a very large K can overlook patients with unusual high-risk characteristics. We try several K values. We also try different **risk thresholds**: for example, a threshold of 0.20 means we flag a patient if at least 20% of their nearest neighbors died.
+
+We choose the settings on a validation set taken from the *training data*, not from the test set. We use **balanced accuracy** to give equal importance to identifying deaths and identifying survivors; Kappa is a secondary measure. The final test set remains untouched until our model is chosen.
+
+```{r tune-knn}
+# Reserve 20% of training data for validation; do not touch the test set
+set.seed(54321)
+validation_rows <- sample(1:nrow(patient_train), 0.2 * nrow(patient_train))
+
+knn_build <- patient_train[-validation_rows, ]
+knn_valid <- patient_train[validation_rows, ]
+
+# Learn the mean and standard deviation on knn_build only
+scaled_valid <- standardize_knn(knn_build, knn_valid, knn_vars)
+
+k_values <- c(11, 21, 31, 51, 101)
+threshold_values <- c(0.15, 0.20, 0.25, 0.30, 0.50)
+
+# Find up to 101 nearest neighbors once, rather than repeating a full search for every K
+neighbors_valid <- RANN::nn2(data = scaled_valid$train,
+                              query = scaled_valid$new,
+                              k = max(k_values), eps = 0)
+
+# Convert neighbor row numbers into 0/1 outcomes
+neighbor_deaths <- matrix(
+  knn_build$hospital_death[as.vector(neighbors_valid$nn.idx)],
+  nrow = nrow(neighbors_valid$nn.idx)
+)
+
+validation_results <- data.frame()
+
+for (k in k_values) {
+  # Estimated death risk = share of deaths among the K nearest neighbors
+  risk <- rowMeans(neighbor_deaths[, 1:k, drop = FALSE])
+
+  for (threshold in threshold_values) {
+    prediction <- ifelse(risk >= threshold, 1, 0)
+
+    cm <- confusionMatrix(
+      factor(prediction, levels = c(0, 1)),
+      factor(knn_valid$hospital_death, levels = c(0, 1)),
+      positive = "1"
+    )
+
+    validation_results <- rbind(validation_results, data.frame(
+      K = k,
+      Threshold = threshold,
+      Accuracy = unname(cm$overall["Accuracy"]),
+      Sensitivity = unname(cm$byClass["Sensitivity"]),
+      Specificity = unname(cm$byClass["Specificity"]),
+      Balanced_Accuracy = unname(cm$byClass["Balanced Accuracy"]),
+      Kappa = unname(cm$overall["Kappa"])
+    ))
+  }
+}
+
+# Prioritize balanced accuracy, then Kappa to break ties
+validation_results <- validation_results[
+  order(-validation_results$Balanced_Accuracy, -validation_results$Kappa), ]
+
+# Display the best ten combinations
+knitr::kable(head(validation_results, 10), digits = 3)
+
+best_k <- validation_results$K[1]
+best_threshold <- validation_results$Threshold[1]
+
+best_k
+best_threshold
+```
+
+The best settings on the validation set were **K = `r best_k`** and a **threshold of `r best_threshold`**. These settings were chosen without using test-set results.
+
+### Final KNN Predictions on the Test Data
+
+We now use **all 70% of the original training data** as reference patients. We standardize the test data with means and standard deviations from the training data, then calculate the fraction of neighbors who died. We evaluate the threshold chosen during validation.
+
+```{r test-knn}
+# Fit preprocessing on the full training set and apply it to the test set
+scaled_test <- standardize_knn(patient_train, patient_test, knn_vars)
+
+# Find the nearest neighbors of every test patient in the training data
+neighbors_test <- RANN::nn2(data = scaled_test$train,
+                             query = scaled_test$new,
+                             k = best_k, eps = 0)
+
+# Probability-like score: proportion of neighbors who died
+neighbor_test_deaths <- matrix(
+  patient_train$hospital_death[as.vector(neighbors_test$nn.idx)],
+  nrow = nrow(neighbors_test$nn.idx)
+)
+knn_test_prob <- rowMeans(neighbor_test_deaths)
+
+# Binary prediction at the threshold selected using validation data
+knn_test_pred <- ifelse(knn_test_prob >= best_threshold, 1, 0)
+
+cm_knn <- confusionMatrix(
+  factor(knn_test_pred, levels = c(0, 1)),
+  factor(patient_test$hospital_death, levels = c(0, 1)),
+  positive = "1"
+)
+cm_knn
+
+# Number of true positives, false negatives, false positives, and true negatives
+TP <- unname(cm_knn$table["1", "1"])
+FN <- unname(cm_knn$table["0", "1"])
+FP <- unname(cm_knn$table["1", "0"])
+TN <- unname(cm_knn$table["0", "0"])
+
+c(True_Positives = TP, False_Negatives = FN,
+  False_Positives = FP, True_Negatives = TN)
+```
+
+### Comparison With the Standard 0.50 Threshold
+
+The current logistic regression file uses a 0.50 cutoff. For reference, we also report how KNN performs using a 0.50 cutoff (the usual majority-vote rule). This makes it easier to understand the effect of adjusting the risk threshold. **The KNN settings chosen during validation remain the primary result**.
+
+```{r compare-threshold}
+knn_pred_05 <- ifelse(knn_test_prob >= 0.50, 1, 0)
+cm_knn_05 <- confusionMatrix(
+  factor(knn_pred_05, levels = c(0, 1)),
+  factor(patient_test$hospital_death, levels = c(0, 1)),
+  positive = "1"
+)
+
+threshold_comparison <- data.frame(
+  Method = c("KNN: tuned threshold", "KNN: threshold 0.50"),
+  Accuracy = c(cm_knn$overall["Accuracy"], cm_knn_05$overall["Accuracy"]),
+  Sensitivity = c(cm_knn$byClass["Sensitivity"], cm_knn_05$byClass["Sensitivity"]),
+  Specificity = c(cm_knn$byClass["Specificity"], cm_knn_05$byClass["Specificity"]),
+  Kappa = c(cm_knn$overall["Kappa"], cm_knn_05$overall["Kappa"])
+)
+knitr::kable(threshold_comparison, digits = 3)
+```
+
+### Results and Interpretation
+
+- **Accuracy:** `r round(100 * cm_knn$overall["Accuracy"], 1)`% of all test patients were classified correctly.
+- **Sensitivity:** `r round(100 * cm_knn$byClass["Sensitivity"], 1)`% of patients who died were identified by KNN.
+- **Specificity:** `r round(100 * cm_knn$byClass["Specificity"], 1)`% of survivors were correctly identified.
+- **Balanced accuracy:** `r round(100 * cm_knn$byClass["Balanced Accuracy"], 1)`%, which gives equal weight to sensitivity and specificity.
+- **Kappa:** `r round(cm_knn$overall["Kappa"], 3)`, which measures agreement beyond what would be expected by chance.
+
+KNN flagged **`r TP`** patients who actually died, but missed **`r FN`** other deaths. It also flagged **`r FP`** patients who survived. Since the purpose is to identify patients needing additional attention, missing high-risk patients is especially important. However, too many false positives would also stretch limited ICU resources.
+
+For context, always predicting "survived" would have an accuracy of `r round(100 * (1 - mean(patient_test$hospital_death)), 1)`% on this same test set. This is why we should not choose our best model on accuracy alone.
+
+### Conclusion
+
+KNN provides a different way to predict ICU mortality compared with logistic regression: it uses similarities between patients instead of coefficients. We selected K and the risk threshold using training/validation data, then evaluated the final model once on the same test patients used by the logistic regression analysis. We should compare both models using **sensitivity, specificity, Kappa, and the number of false negatives** before deciding which model is more useful for allocating ICU resources. These predictions are exploratory and should not be treated as clinical decisions without external validation.
