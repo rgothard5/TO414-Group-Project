@@ -1,0 +1,229 @@
+---
+title: "ANN.rmd"
+author: "Ethan Peterson"
+date: "2026-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+---
+title: "Group Project 2 - Artificial Neural Network (ANN)"
+author: "Ethan Peterson, Jose Soria Miquel, Raegan Gothard, Tarini Bengani, and Yashwant Dubbaka"
+date: "2026-11-20"
+output: html_document
+---
+
+## Artificial Neural Network (ANN)
+
+An artificial neural network predicts whether a patient will die in the hospital by passing the patient's measurements through a layer of hidden nodes. Each hidden node combines the predictors into a new feature, and the output node turns those features into a probability of death. Unlike logistic regression, an ANN can learn nonlinear effects and interactions on its own, without us having to specify them. The tradeoff is that its weights are hard to interpret, so it is better at predicting than at explaining.
+
+Our goal is the same as in the other models: identify high-risk ICU patients who may need closer monitoring. Because only about 8.6% of patients died, **accuracy alone can be misleading**, so we focus on sensitivity (how many actual deaths the model catches), specificity, balanced accuracy, and Kappa.
+
+We use the `nnet` package, which fits a single-hidden-layer network and ships with R. The two main settings are `size` (the number of hidden nodes) and `decay` (a penalty that shrinks the weights and helps prevent overfitting).
+
+### Loading the Cleaned Data and Splitting It
+Neural networks train poorly on predictors with very different scales, so we standardize every predictor using the **training data only**.
+
+```{r split}
+library(caret)  # confusion matrices and performance metrics
+library(nnet)   # single-hidden-layer neural network
+
+# Use the cleaned, dummy-coded dataset
+patient_d <- readRDS("cleaned_dataset.rds")
+
+# Split train test
+ratio <- 0.7
+set.seed(12345)
+train_rows <- sample(1:nrow(patient_d), ratio * nrow(patient_d))
+
+patient_train <- patient_d[train_rows, ]
+patient_test  <- patient_d[-train_rows, ]
+
+# Check sample sizes and outcome balance
+nrow(patient_train)
+nrow(patient_test)
+mean(patient_train$hospital_death)
+mean(patient_test$hospital_death)
+```
+
+### Preparing the Predictors
+
+Unlike KNN, a neural network can handle many predictors, so we use every column in the cleaned data except the outcome. The `decay` penalty keeps the many overlapping predictors (for example, the min and max of the same vital sign) from causing problems. We remove any column that is constant in the training data, since it cannot be standardized and carries no information.
+
+```{r predictors}
+# Every column except the outcome
+ann_vars <- setdiff(names(patient_d), "hospital_death")
+
+# Standardize using the reference (training) data only
+standardize_ann <- function(train_data, new_data, variables) {
+  x_train <- as.matrix(train_data[, variables, drop = FALSE])
+  x_new   <- as.matrix(new_data[, variables, drop = FALSE])
+
+  train_mean <- colMeans(x_train)
+  train_sd   <- apply(x_train, 2, sd)
+  usable     <- is.finite(train_sd) & train_sd > 0   # drop constant columns
+
+  x_train <- scale(x_train[, usable, drop = FALSE],
+                   center = train_mean[usable], scale = train_sd[usable])
+  x_new   <- scale(x_new[, usable, drop = FALSE],
+                   center = train_mean[usable], scale = train_sd[usable])
+
+  stopifnot(all(is.finite(x_train)), all(is.finite(x_new)))
+  list(train = x_train, new = x_new)
+}
+
+# Helper: performance metrics at a given probability threshold
+get_metrics <- function(prob, actual, threshold) {
+  pred <- factor(ifelse(prob >= threshold, 1, 0), levels = c(0, 1))
+  cm <- confusionMatrix(pred, factor(actual, levels = c(0, 1)), positive = "1")
+  list(cm = cm,
+       row = data.frame(
+         Threshold = threshold,
+         Accuracy = unname(cm$overall["Accuracy"]),
+         Sensitivity = unname(cm$byClass["Sensitivity"]),
+         Specificity = unname(cm$byClass["Specificity"]),
+         Balanced_Accuracy = unname(cm$byClass["Balanced Accuracy"]),
+         Kappa = unname(cm$overall["Kappa"])))
+}
+
+# Helper: area under the ROC curve, computed from ranks
+auc_score <- function(prob, actual) {
+  r <- rank(prob)
+  n1 <- sum(actual == 1)
+  n0 <- sum(actual == 0)
+  (sum(r[actual == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+```
+
+### Choosing the Network Size, Decay, and Classification Threshold
+
+A network with too few hidden nodes cannot capture complicated patterns, while one with too many will memorize the training patients. We try several values of `size` and `decay`. We also try different **risk thresholds**: a threshold of 0.20 means we flag a patient if the predicted chance of death is at least 20%.
+
+We choose the settings on a validation set taken from the *training data*, not from the test set. We use **balanced accuracy** to give equal importance to identifying deaths and survivors; Kappa breaks ties. The test set stays untouched until the model is chosen.
+
+```{r tune-ann, cache=TRUE}
+# Reserve 20% of the training data for validation; do not touch the test set
+set.seed(54321)
+validation_rows <- sample(1:nrow(patient_train), 0.2 * nrow(patient_train))
+
+ann_build <- patient_train[-validation_rows, ]
+ann_valid <- patient_train[validation_rows, ]
+
+# Learn the mean and standard deviation on ann_build only
+scaled_valid <- standardize_ann(ann_build, ann_valid, ann_vars)
+
+size_values  <- c(3, 5, 10)
+decay_values <- c(0.01, 0.1, 1)
+threshold_values <- c(0.10, 0.15, 0.20, 0.25, 0.30, 0.50)
+
+validation_results <- data.frame()
+
+for (s in size_values) {
+  for (d in decay_values) {
+    set.seed(2026)
+    fit <- nnet(x = scaled_valid$train, y = ann_build$hospital_death,
+                size = s, decay = d, maxit = 300, MaxNWts = 50000,
+                entropy = TRUE, trace = FALSE)   # entropy = TRUE gives a logistic output
+
+    valid_prob <- as.vector(predict(fit, scaled_valid$new, type = "raw"))
+    valid_auc  <- auc_score(valid_prob, ann_valid$hospital_death)
+
+    for (th in threshold_values) {
+      m <- get_metrics(valid_prob, ann_valid$hospital_death, th)$row
+      validation_results <- rbind(validation_results,
+                                  cbind(Size = s, Decay = d, AUC = valid_auc, m))
+    }
+  }
+}
+
+# Prioritize balanced accuracy, then Kappa to break ties
+validation_results <- validation_results[
+  order(-validation_results$Balanced_Accuracy, -validation_results$Kappa), ]
+
+# Display the best ten combinations
+knitr::kable(head(validation_results, 10), digits = 3, row.names = FALSE)
+
+best_size      <- validation_results$Size[1]
+best_decay     <- validation_results$Decay[1]
+best_threshold <- validation_results$Threshold[1]
+
+best_size
+best_decay
+best_threshold
+```
+
+The best settings on the validation set were **`r best_size` hidden nodes**, a **decay of `r best_decay`**, and a **threshold of `r best_threshold`**. These were chosen without using test-set results.
+
+### Final ANN Predictions on the Test Data
+
+We now refit the network with the chosen settings on **all 70% of the original training data**. We standardize the test data with the training means and standard deviations, then predict each test patient's probability of death. Because the starting weights are random, we fit several networks with different random starts and average their predictions, which makes the result more stable.
+
+```{r test-ann, cache=TRUE}
+scaled_test <- standardize_ann(patient_train, patient_test, ann_vars)
+
+n_starts <- 5
+test_prob_matrix <- sapply(1:n_starts, function(i) {
+  set.seed(1000 + i)
+  fit <- nnet(x = scaled_test$train, y = patient_train$hospital_death,
+              size = best_size, decay = best_decay, maxit = 300, MaxNWts = 50000,
+              entropy = TRUE, trace = FALSE)
+  as.vector(predict(fit, scaled_test$new, type = "raw"))
+})
+
+# Average the predicted probability across the random starts
+ann_test_prob <- rowMeans(test_prob_matrix)
+summary(ann_test_prob)
+
+# Binary prediction at the threshold selected using validation data
+final <- get_metrics(ann_test_prob, patient_test$hospital_death, best_threshold)
+cm_ann <- final$cm
+cm_ann
+
+# Number of true positives, false negatives, false positives, and true negatives
+TP <- unname(cm_ann$table["1", "1"])
+FN <- unname(cm_ann$table["0", "1"])
+FP <- unname(cm_ann$table["1", "0"])
+TN <- unname(cm_ann$table["0", "0"])
+
+c(True_Positives = TP, False_Negatives = FN,
+  False_Positives = FP, True_Negatives = TN)
+
+test_auc <- auc_score(ann_test_prob, patient_test$hospital_death)
+test_auc
+```
+
+### Comparison With the Standard 0.50 Threshold
+
+For reference, we also report how the same network performs with the usual 0.50 cutoff. This shows how much adjusting the risk threshold matters when deaths are rare. **The settings chosen during validation remain the primary result.**
+
+```{r compare-threshold}
+cm_ann_05 <- get_metrics(ann_test_prob, patient_test$hospital_death, 0.50)$cm
+
+threshold_comparison <- data.frame(
+  Method = c("ANN: tuned threshold", "ANN: threshold 0.50"),
+  Accuracy = c(cm_ann$overall["Accuracy"], cm_ann_05$overall["Accuracy"]),
+  Sensitivity = c(cm_ann$byClass["Sensitivity"], cm_ann_05$byClass["Sensitivity"]),
+  Specificity = c(cm_ann$byClass["Specificity"], cm_ann_05$byClass["Specificity"]),
+  Kappa = c(cm_ann$overall["Kappa"], cm_ann_05$overall["Kappa"])
+)
+knitr::kable(threshold_comparison, digits = 3, row.names = FALSE)
+```
+
+### Results and Interpretation
+
+- **Accuracy:** `r round(100 * cm_ann$overall["Accuracy"], 1)`% of all test patients were classified correctly.
+- **Sensitivity:** `r round(100 * cm_ann$byClass["Sensitivity"], 1)`% of patients who died were identified by the ANN.
+- **Specificity:** `r round(100 * cm_ann$byClass["Specificity"], 1)`% of survivors were correctly identified.
+- **Balanced accuracy:** `r round(100 * cm_ann$byClass["Balanced Accuracy"], 1)`%, which gives equal weight to sensitivity and specificity.
+- **Kappa:** `r round(cm_ann$overall["Kappa"], 3)`, which measures agreement beyond what would be expected by chance.
+- **AUC:** `r round(test_auc, 3)`, which measures how well the predicted probabilities rank patients who died above patients who survived, regardless of threshold.
+
+The ANN flagged **`r TP`** patients who actually died, but missed **`r FN`** other deaths. It also flagged **`r FP`** patients who survived. Missing high-risk patients is the costly error because the care team gets no warning, while false positives mostly cost extra monitoring, though too many would still stretch limited ICU resources.
+
+For context, always predicting "survived" would have an accuracy of `r round(100 * (1 - mean(patient_test$hospital_death)), 1)`% on this same test set, which is why we do not choose a model on accuracy alone.
+
+### Conclusion
+
+The ANN gives a more flexible way to predict ICU mortality than logistic regression because it can learn nonlinear effects and interactions without us specifying them. We selected the number of hidden nodes, the decay penalty, and the risk threshold using training/validation data, then evaluated the final model once on the same test patients used by the logistic regression and KNN analyses. The main drawback is interpretability since ANN does not tell us how much each patient characteristic raises or lowers the odds of death.
